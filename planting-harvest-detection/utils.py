@@ -1,0 +1,517 @@
+import pandas as pd
+import numpy as np
+import awswrangler as wr
+import xarray as xr
+import rioxarray
+import geopandas as gpd
+from shapely import wkt
+from scipy.signal import find_peaks
+from zarr.storage import ObjectStore
+from obstore import S3Store
+from pyproj import Transformer
+import re
+from numba import njit
+import concurrent.futures
+import boto3
+from enum import StrEnum, auto
+from xarray import Dataset
+from zarr.codecs.blosc import BloscCodec
+from zarr import config as zconfig
+import posixpath
+import os
+import datetime
+import math
+
+
+def open_dataset_zarr(id_polygon, required_bands=None, skip_signature=False):
+    zarr_path = f"s3://{os.environ['BUCKET_NAME']}/zarr/{id_polygon}.zarr"
+    ds = xr.open_zarr(zarr_path, consolidated=True)
+
+    if required_bands is not None:
+        missing_bands = [band for band in required_bands if band not in ds.data_vars]
+        if missing_bands:
+            raise ValueError(f"Missing required bands: {missing_bands}")
+
+        ds = ds[required_bands]
+
+    ds = ds.chunk({"x": 2048, "y": 2048, "time": 1})
+    return ds
+
+
+def get_crs(ds):
+    """
+    Get the CRS of the dataset.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        The dataset to get the CRS from.
+
+    Returns
+    -------
+    str
+        The CRS of the dataset.
+    """
+    if hasattr(ds, 'rio') and ds.rio.crs is not None:
+        return ds.rio.crs.to_string()
+    crs=getattr(ds, 'crs', None)
+    if crs is None:
+        raise ValueError("CRS not found in the dataset.")
+    return crs
+
+
+def get_projected_centroid(gdf, id_polygon, ds_crs):
+    """
+    Get the projected centroid of a polygon in a GeoDataFrame.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        The GeoDataFrame containing the polygon.
+    id_polygon : str
+        The ID of the polygon to get the centroid for.
+
+    Returns
+    -------
+    tuple
+        The projected centroid coordinates (x, y).
+    """
+    polygon = gdf.loc[gdf['id_polygon'] == id_polygon, 'geometry'].iloc[0]
+    centroid = polygon.representative_point()  # Use representative point to ensure it's within the polygon
+    lon, lat = centroid.x, centroid.y
+    transformer = Transformer.from_crs("EPSG:4326", ds_crs, always_xy=True)
+    projected_x, projected_y = transformer.transform(lon, lat)
+    return projected_x, projected_y
+
+def clip_geom_ds(ds, geometry, ds_crs, crs_geom="EPSG:4326", nodata=None):
+    """
+    Clip the dataset to the given geometry.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        The dataset to clip.
+    geometry : shapely.geometry.Polygon
+        The geometry to clip to.
+    ds_crs : str
+        The CRS of the dataset.
+
+    Returns
+    -------
+    xarray.Dataset
+        The clipped dataset.
+    """
+
+    # If the geometry is a WKT string, convert it to a shapely geometry
+    if isinstance(geometry, str):
+        geometry = wkt.loads(geometry)
+
+    gdf_clip = gpd.GeoDataFrame({"id": [1]}, geometry=[geometry], crs=crs_geom)
+
+    #reproject the geometry to the dataset's CRS
+    gdf_clip = gdf_clip.to_crs(ds_crs)
+
+    if ds.rio.crs is None:
+        raise ValueError("Dataset does not have a CRS. Please set the CRS before clipping.")
+
+    if nodata is not None:
+        for var in ds.data_vars:
+            if "x" in ds[var].dims and "y" in ds[var].dims:
+                if np.issubdtype(ds[var].dtype, np.integer):
+                    ds[var].attrs["nodata"] = nodata
+
+    # Clip the dataset using the reprojected geometry
+    ds_clipped = ds.rio.clip(gdf_clip.geometry, gdf_clip.crs, drop=True)
+
+    return ds_clipped
+
+
+def find_pixel_index(ds, x_proj, y_proj):
+    """
+    Find the pixel index of a projected coordinate in the dataset.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        The dataset to find the pixel index in.
+    x_proj : float
+        The projected x coordinate.
+    y_proj : float
+        The projected y coordinate.
+
+    Returns
+    -------
+    tuple
+        The pixel index (x_index, y_index).
+    """
+
+    idx_x = np.abs(ds.x.values - x_proj).argmin()
+    idx_y = np.abs(ds.y.values - y_proj).argmin()
+
+    return idx_x, idx_y
+
+def clean_repeated_dates(ds):
+    """
+    Clean repeated dates in the dataset by keeping only the first occurrence of each date.
+
+    Parameters:
+    - ds (xarray.Dataset): The dataset to clean.
+    Returns:
+    - ds_unique (xarray.Dataset): The dataset with unique dates.
+    """
+    dates = ds.time.dt.floor("D").values
+    _, index = np.unique(dates, return_index=True)
+    ds_unique = ds.isel(time=index)
+    return ds_unique
+
+
+def filter_incomplete_images(ds_unique):
+    """
+    Filter out incomplete images from the dataset based on the 'scl' variable.
+    Steps:
+    - Calculate a boolean mask where 'scl' is not equal to 0 (indicating valid pixels).
+    - Select dates with the maximum fraction of valid pixels.
+    Parameters:
+    - ds_unique (xarray.Dataset): The dataset to filter.
+    Returns:
+    - ds_filtered (xarray.Dataset): The dataset with incomplete images filtered out.
+    """
+    valid_mask = ds_unique['scl']!= 0
+
+    valid_fraction = valid_mask.mean(dim=['x', 'y']).compute()
+
+    max_fraction = valid_fraction.max().item()
+
+    dates_max_fraction = valid_fraction == max_fraction
+
+    ds_filtered = ds_unique.sel(time=dates_max_fraction)
+    return ds_filtered
+
+ 
+def verify_num_valid_images(ds, var_names=['evi2', 'scl'], min_valid_images=15):
+    """
+    Verify that the dataset contains a minimum number of valid images for the specified variables.
+
+    Parameters:
+    - ds (xarray.Dataset): The dataset to verify.
+    - var_names (list): The names of the variables to check.
+    - min_valid_images (int): The minimum number of valid images required.
+
+    Raises:
+    - ValueError: If any variable has fewer than the minimum number of valid images.
+    """
+    for var in var_names:
+        if var not in ds:
+            raise ValueError(f"Variable '{var}' not found in the dataset.")
+
+        has_data = ds[var].notnull().any(dim=['x', 'y'])
+        num_valid_images = has_data.sum().compute().item()
+
+        if num_valid_images < min_valid_images:
+            raise ValueError(f"Variable '{var}' has fewer than {min_valid_images} valid images.")
+
+
+def preprocess_dataset(ds):
+    """
+    Preprocess the dataset by cleaning repeated dates, filtering incomplete images,
+    verifying the number of valid images, grouping by 5 days, and interpolating missing values.
+
+    Steps:
+    1. Clean repeated dates in the dataset.
+    2. Filter out incomplete images from the dataset.
+    3. Verify the number of valid images in the dataset.
+    4. Group the dataset by 5-day intervals and compute the mean for each group.
+    5. Interpolate missing values in the grouped dataset using forward fill and linear interpolation.
+
+    Parameters:
+    - ds (xarray.Dataset): The input clipped dataset to preprocess.
+
+    Returns:
+    - xarray.Dataset: The preprocessed dataset.
+    """
+
+    # clean repeated dates
+    ds_unique = clean_repeated_dates(ds)
+
+    # clean incomplete images
+    ds_clean = filter_incomplete_images(ds_unique)
+
+    # verify number of valid images
+    verify_num_valid_images(ds_clean)
+
+    # group by 5 days and interpolate missing values
+    ds_grouped = ds_clean.resample(time="5D").mean()
+    ds_grouped = ds_grouped.chunk({"time": -1})
+    ds_filled = ds_grouped.ffill(dim="time", method="linear")
+
+    return ds_filled
+
+
+def calculate_cloud_mask(ds):
+    """
+    Calculate a cloud mask based on the 'scl' variable in the dataset.
+
+    Parameters:
+    - ds (xarray.Dataset): The input dataset containing the 'scl' variable.
+
+    Returns:
+    - xarray.DataArray: A boolean DataArray where True indicates cloud pixels and False indicates non-cloud pixels.
+    """
+    scl = ds['scl']
+    # Define cloud classes based on SCL values
+    cloud_classes = [3, 8, 9, 10]  # SCL values corresponding to clouds
+
+    # Create a boolean mask for cloud pixels
+    cloud_mask = scl.isin(cloud_classes).astype("uint8")
+    cloud_mask.name = "cloud_mask"
+
+    return cloud_mask
+
+
+def smooth_time_series(ds, window_size=3):
+    """
+    Smooth the time series data using a rolling mean.
+
+    Parameters:
+    - ds (xarray.Dataset): The input dataset containing the time series data.
+    - window_size (int): The size of the rolling window for smoothing.
+
+    Returns:
+    - xarray.DataArray: The smoothed time series data.
+    """
+    ds_smooth = ds.rolling(time=window_size, min_periods=1, center=False).mean()
+    return ds_smooth
+
+
+def calculate_derivatives(ds_smooth, t):
+    """
+    Calculate the first derivative of the smoothed time series.
+
+    Parameters:
+    - ds_smooth (xarray.DataArray): The smoothed time series data.
+    - t (numpy.ndarray): Numpy array with time in seconds
+    """
+    y = ds_smooth.values
+
+    first_derivative = np.gradient(y, t, axis=0)
+
+    first_derivative_xr = xr.DataArray(first_derivative, coords=ds_smooth.coords, dims=ds_smooth.dims)
+
+    return first_derivative_xr
+
+
+def consistent_events(d1: np.ndarray, threshold: float, N: int, type='increase', time_axis=0):
+    if type == 'increase':
+        mask = d1 > threshold
+    elif type == 'decrease':
+        mask = d1 < -threshold
+    else:
+        raise ValueError("Invalid type. Must be 'increase' or 'decrease'.")
+
+    def find_consistent_sequences(arr, N):
+        consistent = np.zeros_like(arr, dtype=bool)
+        count = 0
+        for i in range(len(arr)):
+            if arr[i]:
+                count += 1
+            else:
+                if count >= N:
+                    consistent[i - count:i] = True
+                count = 0
+        if count >= N:
+            consistent[len(arr) - count:] = True
+        return consistent
+
+    mask_moved = np.moveaxis(mask, time_axis, 0)
+    output = np.zeros_like(mask_moved, dtype=bool)
+
+    for index in np.ndindex(mask_moved.shape[1:]):
+        output[(slice(None),) + index] = find_consistent_sequences(mask_moved[(slice(None),) + index], N)
+
+    output = np.moveaxis(output, 0, time_axis)
+    return output
+
+
+def calc_baseline_amplitude(evi2_1d: np.ndarray, x:float = 0.2):
+    """
+    Calculate the baseline amplitude of a time series.
+
+    Parameters:
+    - evi2_1d (numpy.ndarray): 1D array of EVI2 values.
+    - x (float): Fraction of the maximum value to consider for baseline calculation.
+
+    Returns:
+    - float: The calculated baseline amplitude.
+    """
+    if np.all(np.isnan(evi2_1d)):
+        baseline = np.nan
+        amplitude = np.nan
+        active = np.zeros_like(evi2_1d, dtype=bool)
+        inactive = np.zeros_like(evi2_1d, dtype=bool)
+    else:
+        baseline = np.nanpercentile(evi2_1d, 10)
+        p90 = np.nanpercentile(evi2_1d, 90)
+        amplitude = p90 - baseline
+        active_threshold = baseline + x * amplitude
+        active = evi2_1d > active_threshold
+        inactive = ~active
+    return baseline, amplitude, active, inactive
+
+
+def calc_baseline_amplitude_flags_numpy(evi2_np: np.ndarray, x: float = 0.2, inside_mask: np.ndarray = None):
+    time_dim, y_dim, x_dim = evi2_np.shape
+
+    baseline_array = np.full((y_dim, x_dim), np.nan, dtype=np.float)
+    amplitude_array = np.full((y_dim, x_dim), np.nan, dtype=np.float)
+    active_array = np.zeros((time_dim, y_dim, x_dim), dtype=bool)
+    inactive_array = np.zeros((time_dim, y_dim, x_dim), dtype=bool)
+
+    if inside_mask is not None:
+        coords = list(zip(*np.where(inside_mask)))
+    else:
+        coords = [(yi,xi) for yi in range(y_dim) for xi in range(x_dim)]
+
+    for yi, xi in coords:
+        baseline, amplitude, active, inactive = calc_baseline_amplitude(evi2_np[:, yi, xi], x=x)
+        baseline_array[yi, xi] = baseline
+        amplitude_array[yi, xi] = amplitude
+        active_array[:, yi, xi] = active
+        inactive_array[:, yi, xi] = inactive
+
+    # Pile the baseline and amplitude arrays along a new axis to create a single array
+    baseline_amplitude= np.stack([baseline_array, amplitude_array], axis=0)
+    return baseline_amplitude, active_array, inactive_array
+
+
+def detect_peaks_and_valleys(
+        ds_smooth_np, active_flag_numpy, inactive_flag_numpy, baseline_amplitude_np, min_distance=10,
+        N_consistent=3, threshold=0.5, debug_pixel=None, inside_mask=None
+        ):
+    """
+    Detect peaks and valleys in the smoothed time series data.
+
+    Parameters:
+    - ds_smooth_np (numpy.ndarray): 3D array of smoothed time series data (time, y, x).
+    - active_flag_numpy (numpy.ndarray): 3D boolean array indicating active pixels (time, y, x).
+    - inactive_flag_numpy (numpy.ndarray): 3D boolean array indicating inactive pixels (time, y, x).
+    - baseline_amplitude_np (numpy.ndarray): 3D array of baseline and amplitude values (2, y, x).
+    - min_distance (int): Minimum distance between peaks/valleys.
+    - N_consistent (int): Number of consistent detections required.
+    - threshold (float): Threshold for peak/valley detection.
+    - debug_pixel (tuple): Coordinates of the pixel to debug.
+    - inside_mask (numpy.ndarray): Boolean array indicating the region of interest.
+
+    Returns:
+    - peaks_indices (list): List of indices of detected peaks.
+    - valleys_indices (list): List of indices of detected valleys.
+    """
+    time_dim, y_dim, x_dim = ds_smooth_np.shape
+    peaks_arr = np.zeros_like(ds_smooth_np, dtype=bool)
+    valleys_arr = np.zeros_like(ds_smooth_np, dtype=bool)
+
+    baseline_array = baseline_amplitude_np[0]
+    amplitude_array = baseline_amplitude_np[1]
+
+    def process_pixel(yi_xi):
+        yi, xi = yi_xi
+        if debug_pixel is not None and (yi, xi) != debug_pixel:
+            return None
+
+        series = ds_smooth_np[:, yi, xi]
+        if np.all(np.isnan(series)):
+            return None
+        if not np.any(active_flag_numpy[:, yi, xi]):
+            return None
+        baseline = baseline_array[yi, xi]
+        amplitude = amplitude_array[yi, xi]
+        if np.isnan(baseline) or np.isnan(amplitude) or amplitude == 0:
+            return None
+        threshold_value = baseline + threshold * amplitude
+        peaks_idx, _ = find_peaks(series, distance=min_distance)
+        peaks_idx = [idx for idx in peaks_idx if series[idx] > threshold_value]
+        valleys_idx, _ = find_peaks(-series, distance=min_distance)
+        valleys_idx = [idx for idx in valleys_idx if series[idx] < threshold_value]
+
+        local_peaks = [idx for idx in peaks_idx if active_flag_numpy[idx, yi, xi]]
+        local_valleys = [idx for idx in valleys_idx if active_flag_numpy[idx, yi, xi]]
+
+        return yi, xi, local_peaks, local_valleys
+
+    if debug_pixel is not None:
+        pixels_to_process = [(debug_pixel[0], debug_pixel[1])]
+    elif inside_mask is not None:
+        pixels_to_process = list(zip(*np.where(inside_mask)))
+    else:
+        pixels_to_process = [(yi, xi) for yi in range(y_dim) for xi in range(x_dim)]
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = executor.map(process_pixel, pixels_to_process)
+
+    for res in results:
+        if res is not None:
+            continue
+        yi,xi, local_peaks, local_valleys = res
+        for t in local_peaks:
+            peaks_arr[t, yi, xi] = True
+        for t in local_valleys:
+            valleys_arr[t, yi, xi] = True
+
+    return {'peaks': peaks_arr, 'valleys': valleys_arr}
+
+
+@njit
+def classify_planting_numba(peaks, valleys, growth, non_classified, N_consistent=3):
+    """
+    Classify planting events based on detected peaks and valleys.
+
+    Parameters:
+    - peaks (numpy.ndarray): 3D boolean array indicating detected peaks (time, y, x).
+    - valleys (numpy.ndarray): 3D boolean array indicating detected valleys (time, y, x).
+    - N_consistent (int): Number of consistent detections required.
+
+    Returns:
+    - numpy.ndarray: 3D boolean array indicating classified planting events (time, y, x).
+    """
+    time_dim, y_dim, x_dim = valleys.shape
+    planting_events = np.zeros_like(valleys, dtype=np.bool_)
+
+    for yi in range(y_dim):
+        for xi in range(x_dim):
+            for t in range(time_dim):
+                if valleys[t, yi, xi]:
+                    if t + N_consistent >= time_dim:
+                        continue
+                    growth_detected = True
+                    for dt in range(t + 1, t + N_consistent + 1):
+                        if not growth[dt, yi, xi]:
+                            growth_detected = False
+                            break
+                    if growth_detected:
+                        planting_events[t, yi, xi] = True
+
+    return planting_events
+
+
+def classify_planting(results, consistent_growth, non_classified, N_consistent=3):
+    """
+    Classify planting events based on detected peaks and valleys.
+
+    Parameters:
+    - results (dict): Dictionary containing detected peaks and valleys.
+    - consistent_growth (numpy.ndarray): 3D boolean array indicating consistent growth (time, y, x).
+    - N_consistent (int): Number of consistent detections required.
+
+    Returns:
+    - numpy.ndarray: 3D boolean array indicating classified planting events (time, y, x).
+    """
+    planting = classify_planting_numba(results['peaks'], results['valleys'], consistent_events, non_classified, N_consistent)
+
+    return {'planting':planting}
+
+
+@njit
+def classify_harvest_numba(peaks, valleys, decrease, non_classified, N_consistent):
+    time_dim, y_dim, x_dim = valleys.shape
+    harvest_events = np.zeros_like(valleys, dtype=np.bool_)
+
+    for 
