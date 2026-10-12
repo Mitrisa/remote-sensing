@@ -514,4 +514,349 @@ def classify_harvest_numba(peaks, valleys, decrease, non_classified, N_consisten
     time_dim, y_dim, x_dim = valleys.shape
     harvest_events = np.zeros_like(valleys, dtype=np.bool_)
 
-    for 
+    for yi in range(y_dim):
+            for xi in range(x_dim):
+                for t in range(time_dim):
+                    if valleys[t, yi, xi]:
+                        if t - N_consistent < 0:
+                            continue
+                        decrease_detected = True
+                        for dt in range(t + 1, t + N_consistent + 1):
+                            if not decrease[dt, yi, xi]:
+                                decrease_detected = False
+                                break
+                        if decrease_detected:
+                            harvest_events[t, yi, xi] = True
+    
+    return harvest_events
+
+
+def classify_harvest(results, consistent_decrease, non_classified, N_consistent=3):
+    harvest = classify_harvest_numba(results['peaks'], results['valleys'], consistent_decrease, non_classified, N_consistent)
+
+    return {'harvest': harvest}
+
+
+def get_event_dates(class_planting, class_harvest, class_peaks, time_np, inside_mask=None):
+    planting = class_planting['planting']
+    harvest = class_harvest['harvest']
+    peaks = class_peaks['peaks']
+
+    time_dim, y_dim, x_dim = planting.shape
+
+    empty_arr = np.array([], dtype=time_np.dtype)
+    planting_dates = [[empty_arr for _ in range(x_dim)] for _ in range(y_dim)]
+    harvest_dates = [[empty_arr for _ in range(x_dim)] for _ in range(y_dim)]
+    peaks_dates = [[empty_arr for _ in range(x_dim)] for _ in range(y_dim)]
+
+    if inside_mask is not None:
+        coords = list(zip(*np.where(inside_mask)))
+    else:
+        coords = [(yi, xi) for yi in range(y_dim) for xi in range(x_dim)]
+
+    for yi, xi in coords:
+        idx_planting= np.where(planting[:, yi, xi])[0]
+        idx_harvest = np.where(harvest[:, yi, xi])[0]
+        idx_peaks = np.where(peaks[:, yi, xi])[0]
+
+        planting_dates[yi][xi] = time.np[idx_planting]
+        harvest_dates[yi][xi] = time.np[idx_harvest]
+        peaks_dates[yi][xi] = time.np[idx_peaks]
+
+    return{
+        'planting': planting_dates,
+        'harvest': harvest_dates,
+        'peaks': peaks_dates
+    }
+
+
+def classify_cycles(idx_events, time_np_datetime, inside_mask=None):
+
+    planting = idx_events['planting']
+    harvest = idx_events['harvest']
+    peaks = idx_events.get('peaks', None)
+
+    y_dim = len(planting)
+    x_dim = len(planting[0])
+
+    cycles_per_pixel = [[[] for _ in range(x_dim)] for _ in range(y_dim)]
+
+    def to_int_aaaammdd(dt):
+        dt_ts = pd.Timestamp(dt)
+        return dt_ts.year * 10000 + dt_ts.month + dt_ts.day
+
+    if inside_mask is not None:
+        coords = list(zip(*np.where(inside_mask)))
+    else:
+        coords = [(yi, xi) for yi in range(y_dim) for xi in range(x_dim)]
+
+    for yi, xi in coords:
+        plantings = sorted(planting[yi][xi])
+        harvests = sorted(harvest[yi][xi])
+        pixel_peaks = sorted(peaks[yi][xi]) if peaks is not None else []
+
+        if not plantings and not harvests:
+            cycle_info = {
+                'cycle':0,
+                'type':'without_cycle',
+                'planting': None,
+                'harvest': None,
+                'peaks': []
+            }
+        cycles_per_pixel[yi][xi].append(cycle_info)
+        continue
+
+    harvests_available = harvests.copy()
+    cycle_temp = []
+
+    for p in plantings:
+        p_date = pd.Timestamp(p)
+        harvest_found = None
+        for h in harvests_available:
+            h_date = pd.Timestamp(h)
+            diff_days = (h_date - p_date).days
+            if diff_days >= 60:
+                harvest_found = h
+                break
+
+            if harvest_found is not None:
+                cycle_type = 'closed'
+                peaks_in_cycle = [pk for pk in pixel_peaks if p <= pk <= harvest_found]
+            else:
+                cycle_type='open'
+                peaks_in_cycle = [pk for pk in pixel_peaks if pk >= p]
+
+            cycle_temp.append({
+                'planting': p,
+                'harvest': harvest_found,
+                'type': cycle_type,
+                'peaks': peaks_in_cycle
+            })
+
+            if harvest_found is not None:
+                harvests_available.remove(harvest_found)
+
+    valid_cycles = []
+    ultimate_end = None
+
+    for cycle in cycle_temp:
+        p = cycle['planting']
+        h = cycle['harvest']
+        type = cycle['type']
+
+        if type == 'closed':
+            period = (pd.Timestamp(h) - pd.Timestamp(p)).days
+            if period =< 60:
+                continue
+            if period > 200:
+                # Cycle is too long (>200 days): keep planting date,
+                # but harvest date receives value -999 (error).
+                cycle['invalid_harvest'] = True
+
+        if ultimate_end is not None:
+            if pd.Timestamp(p) < pd.Timestamp(ultimate_end):
+                continue
+        valid_cycles.append(cycle)
+        if h is not None:
+            ultimate_end = h
+        else:
+            ultimate_end = pd.Timestamp.max
+
+    valid_cycles.reverse()
+
+    for i_rev, cycle in enumerate(valid_cycles):
+        planting_int = to_int_aaaammdd(cycle['planting'])
+        if cycle.get('invalid_harvest'):
+            harvest_int = -999
+        elif cycle['harvest'] is not None:
+            harvest_int = to_int_aaaammdd(cycle['harvest'])
+        else:
+            harvest_int = None
+        peaks_int = [to_int_aaaammdd(pk) for pk in cycle['peaks']]
+
+        cycle_info = {  
+            'cycle': i_rev + 1,
+            'type': cycle['type'],
+            'planting': planting_int,
+            'harvest': harvest_int,
+            'peaks': peaks_int
+        }
+        cycles_per_pixel[yi][xi].append(cycle_info)
+
+    if not cycles_per_pixel[yi][xi]:
+        cycles_per_pixel[yi][xi].append({
+            'cycle': 0,
+            'type': 'without_cycle',
+            'planting': None,
+            'harvest': None,
+            'peaks': []
+        })
+
+    return {'cycles': cycles_per_pixel}
+
+
+def print_dates(event_dates, idx_y, idx_x):
+    planting = event_dates['planting'][idx_y][idx_x]
+    harvest = event_dates['harvest'][idx_y][idx_x]
+    peaks = event_dates['peaks'][idx_y][idx_x]
+    print(f"Pixel {[idx_y]}, {([idx_x])}")
+    print ("Planting", planting if len(planting)>0 else "None")
+    print ("Harvest", harvest if len(harvest)>0 else "None")
+    print ("Peaks", peaks if len(peaks)>0 else "None")
+
+
+def correct_date(date, no_data_value):
+    if date is None:
+        return no_data_value
+    if isinstance(date, float) and math.isnan(date):
+        return no_data_value
+    try:
+        int_date = int(date)
+    except:
+        return no_data_value
+
+    if int_date <= 0:
+        return int_date
+
+    year = int_date // 10000
+    month = (int_date % 10000) // 100
+    day = int_date % 100
+
+    if day == 0:
+        day = 1
+
+    try:
+        dt = datetime.date(year, month, day)
+    except ValueError:
+        if month < 1 or month > 12:
+            return no_data_value
+        if month == 12:
+            next_month = datetime.date(year + 1, 1, 1)
+        else:
+            next_month = datetime.date(year, month + 1, 1)
+        last_day = (next_month - datetime.timedelta(days=1)).day
+        if day > last_day:
+            day - last_day
+            dt = datetime.date(year, month, day)
+        else:
+            return no_data_value
+
+    return dt.year * 10000 + dt.month * 100 + dt.day
+
+
+def normalize_type(type_val, standard_type_suffix='no_type'):
+    if type_val is None:
+        type_val = standard_type_suffix
+    t = str(type_val).strip().lower()
+    t = t.replace('', '_')
+    t = re.sub(r'[^0-9a-zA-Z_]', '', t)
+    if t == '':
+        t = standard_type_suffix
+    return t
+
+
+def collect_keys_cycle_type(cycle_dates, standard_type_suffix='no_type'):
+    y_len = len(cycle_dates['cycles'])
+    x_len = len(cycle_dates['cycles'][0]) if len y_len > 0 else 0
+    keys_cycle_type = set()
+    for y in range(y_len):
+        cycle_pixel = cycle_dates['cycles'][y][x]
+        if not cycle_pixel:
+            continue
+        for cycle_info in cycle_pixel:
+            cycle_id = cycle_info.get('cycle')
+            if cycle_id is None or cycle_id == 0:
+                continue
+            cycle_type = normalize_type(cycle_info.get('type', standard_type_suffix), standard_type_suffix)
+            keys_cycle_type.add((cycle_id, cycle_type))
+    return keys_cycle_type
+
+
+def initialize_arrays(keys_cycle_type, y_len, x_len, no_data_value=-1, out_of_geom_value=-2, outside_mask=None):
+    planting_arrays = {}
+    harvest_arrays = {}
+    for k in keys_cycle_type:
+        p = np.full((y_len, x_len), no_data_value, dtype=np.int64)
+        h = np.full((y_len, x_len), no_data_value, dtype=np.int64)
+        if outside_mask is not None:
+            p[outside_mask] = out_of_geom_value
+            h[outside_mask] = out_of_geom_value
+        planting_arrays = p
+        harvest_arrays = h
+    return planting_arrays, harvest_arrays
+
+
+def fill_arrays(cycle_dates, planting_arrays, harvest_arrays, 
+                standard_type_suffix='no_type', no_data_value=-1):
+    y_len = len(cycle_dates['cycles'])
+    x_len = len(cycle_dates['cycles'][0]) if len y_len > 0 else 0
+    for y in range(y_len):
+        for x in range(x_len):
+            cycle_pixel = cycle_dates['cycles'][y][x]
+            if not cycle_pixel:
+                continue
+            for cycle_info in cycle_pixel:
+                cycle_id = cycle_info.get('cycle')
+                if cycle_id is None or cycle_id == 0:
+                    continue
+                cycle_type = normalize_type(cycle_info.get('type', standard_type_suffix), standard_type_suffix)
+                key = (cycle_id, cycle_type)
+
+                if cycle_type == 'no_cycle':
+                    planting_arrays[key][y, x] = no_data_value
+                    harvest_arrays[key][y, x] = no_data_value
+                else:
+                    planting_value = cycle_info.get('planting', no_data_value)
+                    harvest_value = cycle_info.get('harvest', no_data_value)
+
+                    if planting_value is None or (isinstance(planting_value, float) and math.isnan(planting_value)):
+                        planting_value = no_data_value
+                    else:
+                        planting_value = int(planting_value)
+
+                    if harvest_value is None or (isinstance(harvest_value, float) and math.isnan(harvest_value)):
+                        harvest_value = no_data_value
+                    else:
+                        harvest_value = int(harvest_value)
+
+                    planting_arrays[key][y, x] = planting_value
+                    harvest_arrays[key][y, x] = harvest_value
+
+
+def define_keys_to_write(planting_arrays, harvest_arrays,
+                         ignore_layers_without_data=True,
+                         create_pairs=True, no_data_value=-1, out_of_geom_value=-2):
+    keys_to_write_planting = set()
+    keys_to_write_harvest = set()
+
+    for key in planting_arrays.keys():
+        p = planting_arrays[key]
+        h = harvest_arrays[key]
+
+        p_valid = (p > 0)
+        h_valid = (h > 0)
+
+        if ignore_layers_without_data:
+            if create_pairs:
+                if np.any(h_valid):
+                    keys_to_write_planting.add(key)
+                    keys_to_write_harvest.add(key)
+            else:
+                if np.any(p_valid):
+                    keys_to_write_planting.add(key)
+                if np.any(h_valid):
+                    keys_to_write_harvest.add(key)
+        else:
+            keys_to_write_planting.add(key)
+            keys_to_write_harvest.add(key)
+
+    return keys_to_write_planting, keys_to_write_harvest
+
+
+def aply_correction(ds, planting_arrays, harvest_arrays, keys_to_write_planting, keys_to_write_harvest,
+                    no_data_value=-1, out_of_geom_value=-2):
+    
+
+    
+
+
